@@ -17,12 +17,49 @@
 import os
 import sys
 import logging
+import inspect
 from functools import partial
 from copy import deepcopy
 from typing import List, Optional, Tuple, Union
 
+
+# =============================================================================
+# msProbe 初始化
+#
+# 需要尽可能放在 import torch、Megatron、TransformerEngine 之前，
+# 避免部分 torch API 在 msProbe 初始化前已经被其他模块直接引用。
+# =============================================================================
+_MSPROBE_ENABLED = os.getenv("MSPROBE_ENABLE", "0") == "1"
+_msprobe_debugger = None
+
+if _MSPROBE_ENABLED:
+    from msprobe.pytorch import PrecisionDebugger
+
+    _msprobe_config_path = os.getenv("MSPROBE_CONFIG_PATH")
+
+    if not _msprobe_config_path:
+        raise RuntimeError(
+            "MSPROBE_ENABLE=1，但没有设置 MSPROBE_CONFIG_PATH"
+        )
+
+    if not os.path.isfile(_msprobe_config_path):
+        raise FileNotFoundError(
+            f"msProbe 配置文件不存在: {_msprobe_config_path}"
+        )
+
+    _msprobe_debugger = PrecisionDebugger(
+        config_path=_msprobe_config_path
+    )
+
+    print(
+        f"[msProbe] enabled, config={_msprobe_config_path}",
+        flush=True,
+    )
+
+
 import torch
 import torch._dynamo
+
 
 from argparse import Namespace
 
@@ -47,7 +84,110 @@ try:
 except ImportError:
     has_nvidia_modelopt = False
 
-from megatron.training.training import pretrain
+# =============================================================================
+# 使用 msProbe 包装 Megatron 的完整 train_step
+#
+# 不能只在 forward_step() 中调用 debugger.start/stop/step，
+# 因为 Megatron 的 backward、梯度同步和 optimizer.step 都发生在
+# forward_step() 外部。
+# =============================================================================
+import megatron.training.training as megatron_training
+
+
+# 保留 pretrain 名称，文件下面原来的 pretrain(...) 不需要修改。
+pretrain = megatron_training.pretrain
+
+
+if _MSPROBE_ENABLED:
+    # 保存原始 train_step，避免包装函数递归调用自身。
+    _original_train_step = megatron_training.train_step
+    _original_train_step_signature = inspect.signature(
+        _original_train_step
+    )
+
+    def _msprobe_train_step(*args, **kwargs):
+        """
+        使用 msProbe 包装一个完整的 Megatron training iteration。
+
+        采集范围包含：
+          1. forward
+          2. backward
+          3. gradient synchronization
+          4. optimizer.step
+        """
+
+        # 使用函数签名绑定参数，避免不同 Megatron 版本中
+        # model 参数位置发生变化。
+        try:
+            bound_args = _original_train_step_signature.bind_partial(
+                *args,
+                **kwargs,
+            )
+            model = bound_args.arguments.get("model")
+        except TypeError as bind_error:
+            raise RuntimeError(
+                "[msProbe] 解析 Megatron train_step 参数失败。"
+            ) from bind_error
+
+        if model is None:
+            raise RuntimeError(
+                "[msProbe] 无法从 Megatron train_step 参数中取得 model。"
+            )
+
+        # 此处已经完成 torch.distributed 和 Megatron 并行初始化。
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            global_rank = torch.distributed.get_rank()
+        else:
+            global_rank = -1
+
+        print(
+            f"[msProbe][rank={global_rank}] start train_step",
+            flush=True,
+        )
+
+        debugger_started = False
+
+        try:
+            # Megatron 中的 model 通常是 List[nn.Module]。
+            # 每个 rank 上只包含当前 TP/PP rank 的本地模型分片。
+            _msprobe_debugger.start(model=model)
+            debugger_started = True
+
+            # 原始 train_step 内部执行完整前向、反向和参数更新。
+            result = _original_train_step(*args, **kwargs)
+
+        except BaseException:
+            # 训练异常时尽量关闭采集，使已经采集的数据能够落盘。
+            if debugger_started:
+                try:
+                    _msprobe_debugger.stop()
+                except Exception as stop_error:
+                    print(
+                        f"[msProbe][rank={global_rank}] "
+                        f"stop failed after training exception: {stop_error}",
+                        flush=True,
+                    )
+            raise
+
+        # stop 表示结束当前采集区间。
+        _msprobe_debugger.stop()
+
+        # step 表示结束一个 msProbe step。
+        # 此处一个 msProbe step 对应一个 Megatron iteration，
+        # 而不是一个 micro-batch。
+        _msprobe_debugger.step()
+
+        print(
+            f"[msProbe][rank={global_rank}] finish train_step",
+            flush=True,
+        )
+
+        return result
+
+    # pretrain() 内部从 megatron.training.training 模块的全局命名空间
+    # 查找 train_step，因此替换模块属性即可生效。
+    megatron_training.train_step = _msprobe_train_step
+    
 stimer = StragglerDetector()
 
 # Qwen2.5-VL data handling
