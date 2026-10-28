@@ -64,7 +64,6 @@ from .log_handler import CustomHandler
 ######### FlagScale Begin #########
 import json
 import socket
-from .profiler_reports import export_kernel_reports
 ######### FlagScale Begin #########
 
 # Make default logging level INFO, but filter out all log messages not from MCore.
@@ -3385,27 +3384,15 @@ def create_pytorch_profiler(args, rank):
     if args.pytorch_profiler_collect_chakra:
         et_dir = Path(f"{args.tensorboard_dir}/../chakra")
         et_dir.mkdir(parents=True, exist_ok=True)
-        et = torch.profiler.ExecutionTraceObserver().register_callback(
-            f"{et_dir}/rank-{rank}.json.gz"
-        )
+        et = torch.profiler.ExecutionTraceObserver().register_callback(f"{et_dir}/rank-{torch.distributed.get_rank()}.json.gz")
     else:
         et = None
 
     def trace_handler(p):
         profile_dir = Path(f"{args.tensorboard_dir}/../torch_profile")
         profile_dir.mkdir(parents=True, exist_ok=True)
-        p.export_chrome_trace(f"{profile_dir}/rank-{rank}.json.gz")
+        p.export_chrome_trace(f"{profile_dir}/rank-{torch.distributed.get_rank()}.json.gz")
 
-        ########## FlagScale Begin ##########
-        kernel_details_path, kernel_summary_path, operator_list_path = export_kernel_reports(
-            p.events(), profile_dir, rank, f"{profile_dir}/rank-{rank}.json.gz"
-        )
-        print(f"[CUDA] kernel details report is saved to: {kernel_details_path}")
-        print(f"[CUDA] kernel summary report is saved to: {kernel_summary_path}")
-        print(f"[CUDA] operator list is saved to: {operator_list_path}")
-        ########## FlagScale End ##########
-
-    print_rank_0("Using standard torch.profiler")
     prof = torch.profiler.profile(
         schedule=torch.profiler.schedule(
             wait=max(args.profile_step_start - 1, 0),
@@ -3415,7 +3402,7 @@ def create_pytorch_profiler(args, rank):
         ),
         on_trace_ready=trace_handler,
         record_shapes=args.pytorch_profiler_collect_shapes,
-        profile_memory=args.pytorch_profiler_collect_memory,
+        profile_memory=args.pytorch_profiler_collect_memory,  # FlagScale Modify
         with_stack=args.pytorch_profiler_collect_callstack,
         execution_trace_observer=et,
     )
