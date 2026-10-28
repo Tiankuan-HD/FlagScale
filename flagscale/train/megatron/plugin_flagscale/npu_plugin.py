@@ -26,7 +26,7 @@ def create_pytorch_profiler(args, rank):
     def trace_handler(p):
         profile_dir = Path(f"{args.tensorboard_dir}/../torch_profile")
         profile_dir.mkdir(parents=True, exist_ok=True)
-        p.export_chrome_trace(f"{profile_dir}/rank-{rank}.json.gz")
+        p.export_chrome_trace(f"{profile_dir}/rank-{rank}.json")
 
     print_rank_0("Using torch_npu.profiler for NPU profiling")
     prof = npu_profiler.profile(
