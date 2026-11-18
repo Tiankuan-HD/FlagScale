@@ -451,7 +451,7 @@ class SSHTrainRunner(RunnerBase):
         export_cmd = []
 
         for k, v in cur_envs.items():
-            export_cmd += [f"{k}={v}"]
+            export_cmd += [f"{k}={shlex.quote(str(v))}"]
 
         runner_cmd = _get_runner_cmd_train(
             host, master_addr, master_port, nnodes, node_rank, nproc_per_node, self.config
@@ -464,7 +464,14 @@ class SSHTrainRunner(RunnerBase):
             else:
                 self.user_args += ["--hetero-current-device-type", device_type]
 
-        cmd = shlex.join(export_cmd + runner_cmd + [self.user_script] + self.user_args)
+        # Environment assignments must not go through shlex.join: it quotes the
+        # whole "KEY=value" token, and bash then treats 'KEY=value' as a command
+        # name rather than an assignment, so the launch fails with "command not
+        # found" whenever a value contains shell metacharacters such as ";".
+        # Quote only the value and leave the assignment itself bare.
+        cmd = " ".join(
+            export_cmd + [shlex.join(runner_cmd + [self.user_script] + self.user_args)]
+        )
         # update cmd with node_specific_config
         node_specific_config = {}
         if device_type is not None:
@@ -907,13 +914,20 @@ class CloudTrainRunner(RunnerBase):
     ):
         export_cmd = []
         for k, v in self.user_envs.items():
-            export_cmd += [f"{k}={v}"]
+            export_cmd += [f"{k}={shlex.quote(str(v))}"]
 
         runner_cmd = _get_runner_cmd_train(
             host, master_addr, master_port, nnodes, node_rank, nproc_per_node, self.config
         )
 
-        cmd = shlex.join(export_cmd + runner_cmd + [self.user_script] + self.user_args)
+        # Environment assignments must not go through shlex.join: it quotes the
+        # whole "KEY=value" token, and bash then treats 'KEY=value' as a command
+        # name rather than an assignment, so the launch fails with "command not
+        # found" whenever a value contains shell metacharacters such as ";".
+        # Quote only the value and leave the assignment itself bare.
+        cmd = " ".join(
+            export_cmd + [shlex.join(runner_cmd + [self.user_script] + self.user_args)]
+        )
 
         host_run_script_file = _generate_run_script_train(
             self.config,
