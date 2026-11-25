@@ -1753,6 +1753,24 @@ def validate_args(args, defaults={}):
             '--no-load-optim with --skip-train --perform-rl-step skips the optimizer; ' \
             '--rl-offload-optimizer-during-inference is incompatible (no optimizer to offload).'
 
+    if args.chunked_optimizer_state_offload:
+        if not (
+            args.use_distributed_optimizer
+            and args.use_precision_aware_optimizer
+            and args.optimizer == "adam"
+            and args.bf16
+        ):
+            raise ValueError("Chunked NPU offload requires distributed precision-aware BF16 Adam")
+        if args.optimizer_cpu_offload or args.optimizer_cuda_graph or args.fp8_param_gather:
+            raise ValueError("Chunked NPU offload is incompatible with CPU Adam, CUDA graph, "
+                             "or FP8 parameter gather")
+        if not args.no_save_optim or not args.no_load_optim:
+            raise ValueError("Chunked NPU offload currently requires --no-save-optim and --no-load-optim")
+        if args.optimizer_state_offload_chunk_size_mb <= 0:
+            raise ValueError("Optimizer-state offload chunk size must be positive")
+        if not 0.0 <= args.optimizer_state_offload_fraction <= 1.0:
+            raise ValueError("Optimizer-state offload fraction must be between 0 and 1")
+
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
         assert args.use_precision_aware_optimizer, (
@@ -2678,6 +2696,12 @@ def _add_training_args(parser):
                        help='Optimizer function. '
                             'Note: dist_muon is deprecated; use --optimizer muon '
                             'with --use-distributed-optimizer instead.')
+    group.add_argument('--chunked-optimizer-state-offload', action='store_true',
+                       help='Keep selected Adam states on CPU and update them in chunks on NPU.')
+    group.add_argument('--optimizer-state-offload-chunk-size-mb', type=int, default=64,
+                       help='Target size in MiB of a chunk of whole local optimizer shards.')
+    group.add_argument('--optimizer-state-offload-fraction', type=float, default=1.0,
+                       help='Target fraction of local Adam state bytes offloaded to CPU.')
     group.add_argument('--optimizer-cpu-offload', action='store_true',
                        help='Offload optimizer state to CPU')
     group.add_argument('--optimizer-cuda-graph', action='store_true',
