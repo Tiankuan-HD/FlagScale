@@ -54,6 +54,7 @@ from megatron.core.quantization.utils import (
 
 from megatron.training.argument_utils import ArgumentGroupFactory, core_transformer_config_from_args
 ######### FlagScale Begin #########
+from megatron.plugin.decorators import overridable
 from megatron.training.arguments_fs import add_flagscale_arguments
 
 from megatron.plugin.platform import get_platform
@@ -446,6 +447,13 @@ def tuple_type(x):
         return x
     assert isinstance(x, str)
     return tuple(int(i) for i in x.strip('()').split(','))
+
+@overridable
+def _validate_optimizer_state_offload_args(args):
+    """Validate backend-provided optimizer state offload options."""
+    if getattr(args, "chunked_optimizer_state_offload", False):
+        raise ValueError("Chunked optimizer state offload is not supported by this backend")
+
 
 def validate_args(args, defaults={}):
 
@@ -1753,23 +1761,7 @@ def validate_args(args, defaults={}):
             '--no-load-optim with --skip-train --perform-rl-step skips the optimizer; ' \
             '--rl-offload-optimizer-during-inference is incompatible (no optimizer to offload).'
 
-    if args.chunked_optimizer_state_offload:
-        if not (
-            args.use_distributed_optimizer
-            and args.use_precision_aware_optimizer
-            and args.optimizer == "adam"
-            and args.bf16
-        ):
-            raise ValueError("Chunked NPU offload requires distributed precision-aware BF16 Adam")
-        if args.optimizer_cpu_offload or args.optimizer_cuda_graph or args.fp8_param_gather:
-            raise ValueError("Chunked NPU offload is incompatible with CPU Adam, CUDA graph, "
-                             "or FP8 parameter gather")
-        if not args.no_save_optim or not args.no_load_optim:
-            raise ValueError("Chunked NPU offload currently requires --no-save-optim and --no-load-optim")
-        if args.optimizer_state_offload_chunk_size_mb <= 0:
-            raise ValueError("Optimizer-state offload chunk size must be positive")
-        if not 0.0 <= args.optimizer_state_offload_fraction <= 1.0:
-            raise ValueError("Optimizer-state offload fraction must be between 0 and 1")
+    _validate_optimizer_state_offload_args(args)
 
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
@@ -2697,7 +2689,7 @@ def _add_training_args(parser):
                             'Note: dist_muon is deprecated; use --optimizer muon '
                             'with --use-distributed-optimizer instead.')
     group.add_argument('--chunked-optimizer-state-offload', action='store_true',
-                       help='Keep selected Adam states on CPU and update them in chunks on NPU.')
+                       help='Stage selected optimizer states in chunks on the training device.')
     group.add_argument('--optimizer-state-offload-chunk-size-mb', type=int, default=64,
                        help='Target size in MiB of a chunk of whole local optimizer shards.')
     group.add_argument('--optimizer-state-offload-fraction', type=float, default=1.0,
